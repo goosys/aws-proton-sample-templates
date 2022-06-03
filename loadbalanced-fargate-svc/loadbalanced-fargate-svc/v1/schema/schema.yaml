@@ -9,48 +9,62 @@ schema:
       type: object
       description: "Input properties for a loadbalanced Fargate service"
       properties:
-        port:
-          title: "Port"
-          type: number
-          description: "The port to route traffic to"
-          default: 80
-          minimum: 0
-          maximum: 65535
-        desired_count:
-          title: "Desired count"
-          type: number
-          description: "The default number of Fargate tasks you want running"
-          default: 1
-          minimum: 1
+        service_domain:
+          type: string
+          description: "The service domain name"
+          minLength: 0
+          maxLength: 100
         task_size:
-          title: "Task size"
           type: string
           description: "The size of the task you want to run"
-          enum: ["x-small", "small", "medium", "large", "x-large"]
-          default: "x-small"
+          enum: ["small", "medium", "large"]
+          default: "small"
+        auto_scaling_min_capacity:
+          type: number
+          default: 1
+          minimum: 1
+          maximum: 10
+        auto_scaling_max_capacity:
+          type: number
+          default: 1
+          minimum: 1
+          maximum: 10
         image:
-          title: "Image"
           type: string
-          description: "The name/url of the container image"
-          default: "public.ecr.aws/nginx/nginx:1.21"
-          minLength: 1
+          description: "Do NOT modify manually"
+          default: ""
+          minLength: 0
           maxLength: 200
+        log_level:
+          type: string
+          description: "The value of Rails.config.log_level"
+          enum: ["debug", "info", "warn", "error", "fatal"]
+          default: "info"
+        in_maintenance:
+          type: string
+          description: "The nginx container launch In Maintenance mode"
+          enum: ["Yes", "No"]
+          default: "Yes"
 
     PipelineInputs:
       type: object
       description: "Pipeline input properties"
       properties:
         dockerfile:
-          title: "Dockerfile"
           type: string
           description: "The location of the Dockerfile to build"
-          default: "Dockerfile"
+          default: "deploy/Dockerfile.production"
           minLength: 1
           maxLength: 100
         unit_test_command:
-          title: "Unit test command"
           type: string
           description: "The command to run to unit test the application code"
           default: "echo 'add your unit test command here'"
           minLength: 1
+          maxLength: 200
+        notification_chatbot_arn:
+          type: string
+          description: "The Chatbot Arn to notify to slack on each pipeline events"
+          default: "arn:aws:chatbot::************:chat-configuration/slack-channel/codepipeline-to-slack"
+          minLength: 0
           maxLength: 200

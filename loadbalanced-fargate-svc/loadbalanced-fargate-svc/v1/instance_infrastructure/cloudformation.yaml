@@ -1,10 +1,10 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: Deploy a service on AWS Fargate, hosted in a public subnet, and accessible via a public load balancer.
 Mappings:
+  EnvironmentNameConfig:
+    Environment:
+      Name: '{{environment.name}}'
   TaskSize:
-    x-small:
-      cpu: 256
-      memory: 512
     small:
       cpu: 512
       memory: 1024
@@ -13,16 +13,84 @@ Mappings:
       memory: 2048
     large:
       cpu: 2048
-      memory: 4096
-    x-large:
-      cpu: 4096
-      memory: 8192
+      memory: 4092
+  ResourceTagConfig:
+    Project:
+      Key: '{{environment.outputs.CostProjectTagKey}}'
+      Value: '{{environment.outputs.CostProjectTagValue}}'
+    Service:
+      Key: '{{environment.outputs.CostServiceTagKey}}'
+      Value: '{{environment.outputs.CostServiceTagValue}}'
+    Env:
+      Key: '{{environment.outputs.CostEnvTagKey}}'
+      Value: '{{environment.outputs.CostEnvTagValue}}'
+  ServiceConfig:
+    Maintenance:
+      Image: 'public.ecr.aws/z9d2n7e1/nginx:1.21.0'
+    DomainName:
+      Value: '{{service_instance.inputs.service_domain}}'
+    EncryptedEnvFile:
+      stg: "./deploy/.env.staging.enc"
+      prod: "./deploy/.env.production.enc"
+    DesiredCount:
+      Value: 1
+    Port:
+      Value: 80
+    DB:
+      url: 'mysql2://{{environment.outputs.RDSClusterEndpointAddressAlias}}/{{environment.outputs.RDSDatabaseName}}'
+    DBUserName:
+      ValueFrom: '{{environment.outputs.RDSMasterUserNameForECS}}'
+    DBPassword:
+      ValueFrom: '{{environment.outputs.RDSMasterUserPasswordForECS}}'
+    Redis:
+      url: 'redis://{{environment.outputs.CacheClusterPrimaryEndpointAddressAlias}}:6379'
+      namespace: '{{environment.outputs.RDSDatabaseName}}'
+    LogLevel:
+      Value: '{{service_instance.inputs.log_level}}'
+
+Conditions:
+  inMaintence: !Equals 
+    - '{{service_instance.inputs.in_maintenance}}'
+    - 'Yes'
+  inService: !Equals 
+    - '{{service_instance.inputs.in_maintenance}}'
+    - 'No'
+
 Resources:
+
   # A log group for storing the stdout logs from this service's containers
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: '{{service.name}}/{{service_instance.name}}'
+
+  # A bucket for uploading assets and cache files
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - POST
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - Fn::Join:
+                - ''
+                - - 'https://'
+                  - !FindInMap ['ServiceConfig', 'DomainName', 'Value']
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
 
   # The task definition. This is a simple metadata description of what
   # container to run, and what resource requirements it has.
@@ -36,20 +104,150 @@ Resources:
       RequiresCompatibilities:
         - FARGATE
       ExecutionRoleArn: '{{environment.outputs.ECSTaskExecutionRole}}'
-      TaskRoleArn: !Ref "AWS::NoValue"
-      ContainerDefinitions:
-        - Name: '{{service_instance.name}}'
-          Cpu: !FindInMap [TaskSize, {{service_instance.inputs.task_size}}, cpu]
-          Memory: !FindInMap [TaskSize, {{service_instance.inputs.task_size}}, memory]
-          Image: '{{service_instance.inputs.image}}'
-          PortMappings:
-            - ContainerPort: '{{service_instance.inputs.port}}'
-          LogConfiguration:
-            LogDriver: 'awslogs'
-            Options:
-              awslogs-group: '{{service.name}}/{{service_instance.name}}'
-              awslogs-region: !Ref 'AWS::Region'
-              awslogs-stream-prefix: '{{service.name}}/{{service_instance.name}}'
+      TaskRoleArn: !Ref ECSTaskRole
+      ContainerDefinitions: !If
+        - inService
+        - - Name: web
+            Image: '{{service_instance.inputs.image}}'
+            Essential: true
+            DependsOn:
+              - Condition: COMPLETE
+                ContainerName: update
+            LogConfiguration:
+              LogDriver: 'awslogs'
+              Options:
+                awslogs-group: '{{service.name}}/{{service_instance.name}}'
+                awslogs-region: !Ref 'AWS::Region'
+                awslogs-stream-prefix: '{{service.name}}/{{service_instance.name}}'
+            PortMappings:
+              - ContainerPort: !FindInMap ['ServiceConfig', 'Port', 'Value']
+            Environment:
+              - Name: VPC_CIDR
+                Value: '{{environment.outputs.VpcCIDR}}'
+              - Name: ENCRYPTED_ENV_FILE
+                Value: !FindInMap ['ServiceConfig', 'EncryptedEnvFile', '{{environment.outputs.ServiceEnvironment}}']
+              - Name: APP_HOST
+                Value: !FindInMap ['ServiceConfig', 'DomainName', 'Value']
+              - Name: AWS_REGION
+                Value: !Ref 'AWS::Region'
+              - Name: AWS_S3_BUCKET
+                Value: !Ref S3Bucket
+              - Name: DATABASE_URL
+                Value: !FindInMap ['ServiceConfig', 'DB', 'url']
+              - Name: REDIS_URL
+                Value: !FindInMap ['ServiceConfig', 'Redis', 'url']
+              - Name: REDIS_NAMESPACE
+                Value: !FindInMap ['ServiceConfig', 'Redis', 'namespace']
+              - Name: LOG_LEVEL
+                Value: !FindInMap ['ServiceConfig', 'LogLevel', 'Value']
+            Secrets:
+              - Name: ENCRYPTION_KEY
+                ValueFrom: '{{environment.outputs.EncryptionKey}}'
+              - Name: DATABASE_USERNAME
+                ValueFrom: !FindInMap ['ServiceConfig', 'DBUserName', 'ValueFrom']
+              - Name: DATABASE_PASSWORD
+                ValueFrom: !FindInMap ['ServiceConfig', 'DBPassword', 'ValueFrom']
+          - Name: update
+            Image: '{{service_instance.inputs.image}}'
+            Command:
+              - rails
+              - "db:migrate"
+            Essential: false
+            LogConfiguration:
+              LogDriver: 'awslogs'
+              Options:
+                awslogs-group: '{{service.name}}/{{service_instance.name}}'
+                awslogs-region: !Ref 'AWS::Region'
+                awslogs-stream-prefix: '{{service.name}}/{{service_instance.name}}'
+            Environment:
+              - Name: ENCRYPTED_ENV_FILE
+                Value: !FindInMap ['ServiceConfig', 'EncryptedEnvFile', '{{environment.outputs.ServiceEnvironment}}']
+              - Name: APP_HOST
+                Value: !FindInMap ['ServiceConfig', 'DomainName', 'Value']
+              - Name: AWS_REGION
+                Value: !Ref 'AWS::Region'
+              - Name: AWS_S3_BUCKET
+                Value: !Ref S3Bucket
+              - Name: DATABASE_URL
+                Value: !FindInMap ['ServiceConfig', 'DB', 'url']
+              - Name: REDIS_URL
+                Value: !FindInMap ['ServiceConfig', 'Redis', 'url']
+              - Name: REDIS_NAMESPACE
+                Value: !FindInMap ['ServiceConfig', 'Redis', 'namespace']
+              - Name: LOG_LEVEL
+                Value: !FindInMap ['ServiceConfig', 'LogLevel', 'Value']
+            Secrets:
+              - Name: ENCRYPTION_KEY
+                ValueFrom: '{{environment.outputs.EncryptionKey}}'
+              - Name: DATABASE_USERNAME
+                ValueFrom: !FindInMap ['ServiceConfig', 'DBUserName', 'ValueFrom']
+              - Name: DATABASE_PASSWORD
+                ValueFrom: !FindInMap ['ServiceConfig', 'DBPassword', 'ValueFrom']
+          - Name: worker
+            Image: '{{service_instance.inputs.image}}'
+            Command:
+              - bundle
+              - exec
+              - sidekiq
+              - -C
+              - "config/sidekiq.yml"
+            Essential: true
+            DependsOn:
+              - Condition: COMPLETE
+                ContainerName: update
+            LogConfiguration:
+              LogDriver: 'awslogs'
+              Options:
+                awslogs-group: '{{service.name}}/{{service_instance.name}}'
+                awslogs-region: !Ref 'AWS::Region'
+                awslogs-stream-prefix: '{{service.name}}/{{service_instance.name}}'
+            Environment:
+              - Name: ENCRYPTED_ENV_FILE
+                Value: !FindInMap ['ServiceConfig', 'EncryptedEnvFile', '{{environment.outputs.ServiceEnvironment}}']
+              - Name: APP_HOST
+                Value: !FindInMap ['ServiceConfig', 'DomainName', 'Value']
+              - Name: AWS_REGION
+                Value: !Ref 'AWS::Region'
+              - Name: AWS_S3_BUCKET
+                Value: !Ref S3Bucket
+              - Name: DATABASE_URL
+                Value: !FindInMap ['ServiceConfig', 'DB', 'url']
+              - Name: REDIS_URL
+                Value: !FindInMap ['ServiceConfig', 'Redis', 'url']
+              - Name: REDIS_NAMESPACE
+                Value: !FindInMap ['ServiceConfig', 'Redis', 'namespace']
+              - Name: LOG_LEVEL
+                Value: !FindInMap ['ServiceConfig', 'LogLevel', 'Value']
+            Secrets:
+              - Name: ENCRYPTION_KEY
+                ValueFrom: '{{environment.outputs.EncryptionKey}}'
+              - Name: DATABASE_USERNAME
+                ValueFrom: !FindInMap ['ServiceConfig', 'DBUserName', 'ValueFrom']
+              - Name: DATABASE_PASSWORD
+                ValueFrom: !FindInMap ['ServiceConfig', 'DBPassword', 'ValueFrom']
+        - - Name: web
+            Image: !FindInMap ['ServiceConfig', 'Maintenance', 'Image']
+            Essential: true
+            LogConfiguration:
+              LogDriver: 'awslogs'
+              Options:
+                awslogs-group: '{{service.name}}/{{service_instance.name}}'
+                awslogs-region: !Ref 'AWS::Region'
+                awslogs-stream-prefix: '{{service.name}}/{{service_instance.name}}'
+            PortMappings:
+              - ContainerPort: !FindInMap ['ServiceConfig', 'Port', 'Value']
+            Environment:
+              - Name: APP_HOST
+                Value: !FindInMap ['ServiceConfig', 'DomainName', 'Value']
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
 
   # The service_instance.inputs. The service is a resource which allows you to run multiple
   # copies of a type of task, and gather up their logs and metrics, as well
@@ -62,22 +260,30 @@ Resources:
       Cluster: '{{environment.outputs.ClusterName}}'
       LaunchType: FARGATE
       DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
         MaximumPercent: 200
         MinimumHealthyPercent: 75
-      DesiredCount: '{{service_instance.inputs.desired_count}}'
+      DesiredCount: !FindInMap ['ServiceConfig', 'DesiredCount', 'Value']
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
           SecurityGroups:
             - '{{environment.outputs.ContainerSecurityGroup}}'
+            - '{{environment.outputs.VpcDefaultSecurityGroup}}'
           Subnets:
             - '{{environment.outputs.PublicSubnetOne}}'
             - '{{environment.outputs.PublicSubnetTwo}}'
       TaskDefinition: !Ref 'TaskDefinition'
       LoadBalancers:
-        - ContainerName: '{{service_instance.name}}'
-          ContainerPort: '{{service_instance.inputs.port}}'
+        - ContainerName: 'web'
+          ContainerPort: !FindInMap ['ServiceConfig', 'Port', 'Value']
           TargetGroupArn: !Ref 'TargetGroup'
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
 
   # A target group. This is used for keeping track of all the tasks, and
   # what IP addresses / port numbers they have. You can query it yourself,
@@ -87,10 +293,13 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      HealthCheckIntervalSeconds: 6
-      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: !If
+        - inService
+        - /health
+        - /
       HealthCheckProtocol: HTTP
-      HealthCheckTimeoutSeconds: 5
+      HealthCheckTimeoutSeconds: 6
       HealthyThresholdCount: 2
       TargetType: ip
       # Note that the Name property has a 32 character limit, which could be
@@ -98,10 +307,13 @@ Resources:
       # or a combination of both as we're doing here, so we truncate the name to 29 characters
       # plus an ellipsis different from '...' or '---' to avoid running into errors.
       Name: '{{(service.name~"--"~service_instance.name)|truncate(29, true, 'zzz', 0)}}'
-      Port: '{{service_instance.inputs.port}}'
+      Port: !FindInMap ['ServiceConfig', 'Port', 'Value']
       Protocol: HTTP
       UnhealthyThresholdCount: 2
       VpcId: '{{environment.outputs.VpcId}}'
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
 
   # Create a rule on the load balancer for routing traffic to the target group
   LoadBalancerRule:
@@ -111,10 +323,10 @@ Resources:
         - TargetGroupArn: !Ref 'TargetGroup'
           Type: 'forward'
       Conditions:
-        - Field: path-pattern
+        - Field: host-header
           Values:
-            - '*'
-      ListenerArn: !Ref PublicLoadBalancerListener
+            - !FindInMap ['ServiceConfig', 'DomainName', 'Value']
+      ListenerArn: '{{environment.outputs.PublicLoadBalancerHttpsListener}}'
       Priority: 1
 
   # Enable autoscaling for this service
@@ -130,8 +342,8 @@ Resources:
           - - service
             - '{{environment.outputs.ClusterName}}'
             - '{{service.name}}_{{service_instance.name}}'
-      MinCapacity: 1
-      MaxCapacity: 10
+      MinCapacity: {{service_instance.inputs.auto_scaling_min_capacity}}
+      MaxCapacity: {{service_instance.inputs.auto_scaling_max_capacity}}
       RoleARN: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService
 
   # Create scaling policies for the service
@@ -254,54 +466,43 @@ Resources:
       AlarmActions:
         - !Ref ScaleUpPolicy
 
-  EcsSecurityGroupIngressFromPublicALB:
-    Type: AWS::EC2::SecurityGroupIngress
+  # This is a role which is used by the ECS tasks themselves.
+  ECSTaskRole:
+    Type: AWS::IAM::Role
     Properties:
-      Description: Ingress from the public ALB
-      GroupId: '{{environment.outputs.ContainerSecurityGroup}}'
-      IpProtocol: -1
-      SourceSecurityGroupId: !Ref 'PublicLoadBalancerSG'
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonSesSendingAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ses:SendRawEmail"
+                Resource: "*"
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:*"
+                Resource:
+                  - !GetAtt 
+                    - S3Bucket
+                    - Arn
+                  - !Join [ "", [ !GetAtt [S3Bucket, Arn], "/" ]]
+                  - !Join [ "", [ !GetAtt [S3Bucket, Arn], "/*" ]]
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
 
-  # Public load balancer, hosted in public subnets that is accessible
-  # to the public, and is intended to route traffic to one or more public
-  # facing services. This is used for accepting traffic from the public
-  # internet and directing it to public facing microservices
-  PublicLoadBalancerSG:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Access to the public facing load balancer
-      VpcId: '{{environment.outputs.VpcId}}'
-      SecurityGroupIngress:
-          # Allow access to ALB from anywhere on the internet
-          - CidrIp: 0.0.0.0/0
-            IpProtocol: -1
-
-  PublicLoadBalancer:
-    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
-    Properties:
-      Scheme: internet-facing
-      LoadBalancerAttributes:
-      - Key: idle_timeout.timeout_seconds
-        Value: '30'
-      Subnets:
-        # The load balancer is placed into the public subnets, so that traffic
-        # from the internet can reach the load balancer directly via the internet gateway
-        - '{{environment.outputs.PublicSubnetOne}}'
-        - '{{environment.outputs.PublicSubnetTwo}}'
-      SecurityGroups: [!Ref 'PublicLoadBalancerSG']
-
-  PublicLoadBalancerListener:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    DependsOn:
-      - PublicLoadBalancer
-    Properties:
-      DefaultActions:
-        - TargetGroupArn: !Ref 'TargetGroup'
-          Type: 'forward'
-      LoadBalancerArn: !Ref 'PublicLoadBalancer'
-      Port: 80
-      Protocol: HTTP
 Outputs:
-  ServiceEndpoint:
-    Description: The URL to access the service
-    Value: !Sub "http://${PublicLoadBalancer.DNSName}"
+  S3Bucket:
+    Value: !Ref S3Bucket
+  S3BucketArn:
+    Value: !GetAtt [S3Bucket, Arn]

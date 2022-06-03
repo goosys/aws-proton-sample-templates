@@ -7,21 +7,50 @@ schema:
       type: object
       description: "Input properties for my environment"
       properties:
-        vpc_cidr:
-          title: "VPC CIDR"
+        project_base_name:
           type: string
-          description: "This CIDR range for your VPC"
-          default: 10.0.0.0/16
-          pattern: ([0-9]{1,3}\.){3}[0-9]{1,3}($|/(16|24))
-        subnet_one_cidr:
-          title: "Subnet one CIDR"
+          description: "Project Base Name"
+          pattern: ([a-z]{3,10})
+          default: pjname
+        project_short_name:
           type: string
-          description: "The CIDR range for subnet one"
-          default: 10.0.0.0/24
-          pattern: ([0-9]{1,3}\.){3}[0-9]{1,3}($|/(16|24))
-        subnet_two_cidr:
-          title: "Subnet two CIDR"
+          description: "Project Name"
+          pattern: ([a-z]{3,10})
+          default: sample
+        service_environment:
           type: string
-          description: "The CIDR range for subnet two"
-          default: 10.0.1.0/24
-          pattern: ([0-9]{1,3}\.){3}[0-9]{1,3}($|/(16|24))
+          description: "Deployment Environment"
+          enum: ["prod", "stg"]
+          default: "stg"
+        service_certificate_arn:
+          type: string
+          description: "Certificate Manager Arn"
+          default: "arn:aws:acm:ap-northeast-1:************:certificate/********-****-"
+          minLength: 4
+        has_elastic_ip:
+          type: string
+          description: "Do you want ElasticIP?"
+          enum: ["Yes", "No"]
+          default: "No"
+        db_engine_mode:
+          type: string
+          enum: ["provisioned", "serverless"]
+          default: "serverless"
+        provisioned_db_instance_class:
+          type: string
+          enum: ["db.t3.small", "db.t3.medium"]
+          default: "db.t3.small"
+        serverless_db_capacity:
+          type: string
+          description: "autopause: Autopause until 8 hours, low: Capacity 1 to 2, high: Capacity 2 to 4"
+          enum: ["autopause", "low", "high"]
+          default: "low"
+        container_insights:
+          type: string
+          enum: ["enabled", "disabled"]
+          default: "disabled"
+        deletion_protection:
+          type: string
+          enum: ["Yes","No"]
+          default: "No"
+

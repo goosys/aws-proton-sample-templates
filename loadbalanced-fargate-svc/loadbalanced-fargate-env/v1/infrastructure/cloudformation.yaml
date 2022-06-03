@@ -1,81 +1,373 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: AWS Fargate cluster running containers in a public subnet. Only supports
-             public facing load balancer, and public service discovery namespaces.
+Description: Fargate Cluster, ALB, private and public subnets, EIP for private subnet, RDS Cluster, Redis Cluster, WAF
 Mappings:
   # The VPC and subnet configuration is passed in via the environment spec.
+  EnvironmentNameConfig:
+    Environment:
+      Name: '{{ environment.name}}'
+  ResourceTagConfig:
+    Project:
+      Key: 'Cost:Project'
+      Value: '{{ environment.inputs.project_base_name }}'
+    Service:
+      Key: 'Cost:Service'
+      Value: '{{ environment.inputs.project_base_name }}-{{ environment.inputs.project_short_name }}'
+    Env:
+      Key: 'Cost:Env'
+      Value: '{{ {"stg": "staging", "prod": "production"}[environment.inputs.service_environment] }}'
   SubnetConfig:
     VPC:
-      CIDR: '{{ environment.inputs.vpc_cidr}}'
+      CIDR: '10.0.0.0/16'
     PublicOne:
-      CIDR: '{{ environment.inputs.subnet_one_cidr}}'
+      CIDR: '10.0.1.0/24'
     PublicTwo:
-      CIDR: '{{ environment.inputs.subnet_two_cidr}}'
+      CIDR: '10.0.2.0/24'
+    PrivateOne:
+      CIDR: '10.0.3.0/24'
+    PrivateTwo:
+      CIDR: '10.0.4.0/24'
+  ServiceConfig:
+    PrivateHostedZone:
+      Name: 'local'
+    RDSClusterAlias:
+      Name: 'db-cluster.local'
+    CacheClusterAlias:
+      Name: 'cache-cluster.local'
+    EncryptionKey:
+      Name: '{{ environment.inputs.project_base_name }}-{{ environment.inputs.project_short_name }}-{{ environment.inputs.service_environment }}-env-encryption-key'
+    RDSMasterUserSecret:
+      Name: '{{ environment.inputs.project_base_name }}-{{ environment.inputs.project_short_name }}-{{ environment.inputs.service_environment }}-RDSMasterUserSecret'
+    CertificateArn:
+      Value: '{{environment.inputs.service_certificate_arn}}'
+    WebAcl:
+      Name: '{{ environment.inputs.project_base_name }}-{{ environment.inputs.project_short_name }}-{{ environment.inputs.service_environment }}-web-acl'
+  DBEngine:
+    serverless:
+      Name: aurora-mysql
+      # https://docs.aws.amazon.com/ja_jp/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Updates.ServerlessUpdates.html
+      Version: '5.7.mysql_aurora.2.07.1'
+    provisioned:
+      Name: aurora-mysql
+      # https://docs.aws.amazon.com/ja_jp/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Updates.20Updates.html
+      Version: '5.7.mysql_aurora.2.10.2'
+      InstanceClass: '{{ environment.inputs.provisioned_db_instance_class }}'
+  DBScalingConfiguration:
+    autopause:
+      MinCapacity: 1
+      MaxCapacity: 1
+      AutoPause: true
+      SecondsUntilAutoPause: {{ 60 * 60 * 8 }}
+    low:
+      MinCapacity: 1
+      MaxCapacity: 2
+      AutoPause: false
+      SecondsUntilAutoPause: 0
+    high:
+      MinCapacity: 2
+      MaxCapacity: 4
+      AutoPause: false
+      SecondsUntilAutoPause: 0
+  DBConfig:
+    DatabaseName:
+      stg: 'staging'
+      prod: 'production'
+    BackupRetentionPeriod:
+      Value: 7
+    PreferredBackupWindow:
+      Value: 15:25-15:55
+    PreferredMaintenanceWindow:
+      Value: Tue:16:05-Tue:16:35
+
+Conditions:
+  CreateElasticIp: !Equals 
+    - '{{ environment.inputs.has_elastic_ip }}'
+    - 'Yes'
+  SetDeletionProtection: !Equals
+    - '{{ environment.inputs.deletion_protection }}'
+    - 'Yes'
+  ChoiceServerlessDB: !Equals
+    - '{{ environment.inputs.db_engine_mode }}'
+    - 'serverless'
+  ChoiceProvisionedDB: !Equals
+    - '{{ environment.inputs.db_engine_mode }}'
+    - 'provisioned'
+
 Resources:
+  # ------------------------------------------------------------#
+  # VPC
+  # ------------------------------------------------------------#
+  # Create the VPC with subnets across 2 Availability Zones, 2 Public subnets, 2 Private subnets,
+  # an Internet Gateway, 2 Nat Gateways and the required routetables and routes
   VPC:
     Type: AWS::EC2::VPC
     Properties:
-      EnableDnsSupport: true
-      EnableDnsHostnames: true
       CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
 
-  # Two public subnets, where containers will have public IP addresses
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
   PublicSubnetOne:
     Type: AWS::EC2::Subnet
     Properties:
+      VpcId: !Ref VPC
       AvailabilityZone:
-         Fn::Select:
-         - 0
-         - Fn::GetAZs: {Ref: 'AWS::Region'}
-      VpcId: !Ref 'VPC'
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: {Ref: 'AWS::Region'}
       CidrBlock: !FindInMap ['SubnetConfig', 'PublicOne', 'CIDR']
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+                - "public"
+                - "1"
 
   PublicSubnetTwo:
     Type: AWS::EC2::Subnet
     Properties:
+      VpcId: !Ref VPC
       AvailabilityZone:
-         Fn::Select:
-         - 1
-         - Fn::GetAZs: {Ref: 'AWS::Region'}
-      VpcId: !Ref 'VPC'
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: {Ref: 'AWS::Region'}
       CidrBlock: !FindInMap ['SubnetConfig', 'PublicTwo', 'CIDR']
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+                - "public"
+                - "2"
 
-  # Setup networking resources for the public subnets. Containers
-  # in the public subnets have public IP addresses and the routing table
-  # sends network traffic via the internet gateway.
-  InternetGateway:
-    Type: AWS::EC2::InternetGateway
-  GatewayAttachement:
-    Type: AWS::EC2::VPCGatewayAttachment
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref 'VPC'
-      InternetGatewayId: !Ref 'InternetGateway'
+      VpcId: !Ref VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 0
+        - Fn::GetAZs: {Ref: 'AWS::Region'}
+      CidrBlock: !FindInMap ['SubnetConfig', 'PrivateOne', 'CIDR']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+                - "private"
+                - "1"
+
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone:
+        Fn::Select:
+        - 1
+        - Fn::GetAZs: {Ref: 'AWS::Region'}
+      CidrBlock: !FindInMap ['SubnetConfig', 'PrivateTwo', 'CIDR']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Join:
+              - "-"
+              - - !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+                - "private"
+                - "2"
+
+  NatGatewayOneEIP:
+    Type: AWS::EC2::EIP
+    Condition: CreateElasticIp
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  NatGatewayTwoEIP:
+    Type: AWS::EC2::EIP
+    Condition: CreateElasticIp
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  NatGatewayOne:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateElasticIp
+    Properties:
+      AllocationId: !GetAtt NatGatewayOneEIP.AllocationId
+      SubnetId: !Ref PublicSubnetOne
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  NatGatewayTwo:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateElasticIp
+    Properties:
+      AllocationId: !GetAtt NatGatewayTwoEIP.AllocationId
+      SubnetId: !Ref PublicSubnetTwo
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
-      VpcId: !Ref 'VPC'
-  PublicRoute:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+
+  DefaultPublicRoute:
     Type: AWS::EC2::Route
-    DependsOn: GatewayAttachement
+    DependsOn: InternetGatewayAttachment
     Properties:
-      RouteTableId: !Ref 'PublicRouteTable'
-      DestinationCidrBlock: '0.0.0.0/0'
-      GatewayId: !Ref 'InternetGateway'
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
   PublicSubnetOneRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnetOne
       RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetOne
+
   PublicSubnetTwoRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
-      SubnetId: !Ref PublicSubnetTwo
       RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetTwo
 
-  # ECS Resources
+  PrivateRouteTableOne:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+
+  DefaultPrivateRouteOne:
+    Type: AWS::EC2::Route
+    Condition: CreateElasticIp
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayOne
+
+  PrivateSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      SubnetId: !Ref PrivateSubnetOne
+
+  PrivateRouteTableTwo:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+
+  DefaultPrivateRouteTwo:
+    Type: AWS::EC2::Route
+    Condition: CreateElasticIp
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayTwo
+
+  PrivateSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      SubnetId: !Ref PrivateSubnetTwo
+
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !FindInMap ['ServiceConfig', 'PrivateHostedZone', 'Name']
+      VPCs:
+        - VPCId: !Ref 'VPC'
+          VPCRegion:
+            Fn::Sub: "${AWS::Region}"
+      HostedZoneTags:
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  # ------------------------------------------------------------#
+  # ECS (Fargate)
+  # ------------------------------------------------------------#
+  # Create the ECS Cluster to schedule and orchestrate the Fargate containers
   ECSCluster:
     Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: '{{ environment.inputs.container_insights }}'
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
 
   # A security group for the containers we will run in Fargate.
   # Rules are added to this security group based on what ingress you
@@ -85,6 +377,9 @@ Resources:
     Properties:
       GroupDescription: Access to the Fargate containers
       VpcId: !Ref 'VPC'
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
 
   # This is a role which is used by the ECS tasks themselves.
   ECSTaskExecutionRole:
@@ -99,24 +394,495 @@ Resources:
       Path: /
       ManagedPolicyArns:
         - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: KmsRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "secretsmanager:GetSecretValue"
+                Resource:
+                  - !Ref EncryptionKey
+                  - !Ref RDSMasterUserSecret
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+
+  # SecretsManager
+  EncryptionKey:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !FindInMap ['ServiceConfig', 'EncryptionKey', 'Name']
+      Description: "This secret has a dynamically generated secret."
+      GenerateSecretString:
+        ExcludeLowercase: false
+        ExcludeNumbers: false
+        ExcludePunctuation: true
+        ExcludeUppercase: false
+        IncludeSpace: false
+        RequireEachIncludedType: true
+        PasswordLength: 36
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  # ------------------------------------------------------------#
+  # RDS (MySQL)
+  # ------------------------------------------------------------#
+  RDSCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DatabaseName: !FindInMap ['DBConfig', 'DatabaseName', '{{ environment.inputs.service_environment }}']
+      MasterUsername: !Join ['', ['{{ "{{" }}resolve:secretsmanager:', !Ref RDSMasterUserSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{ "{{" }}resolve:secretsmanager:', !Ref RDSMasterUserSecret, ':SecretString:password}}' ]]
+      EngineMode: '{{ environment.inputs.db_engine_mode }}'
+      Engine: !FindInMap ['DBEngine', '{{ environment.inputs.db_engine_mode }}', 'Name']
+      EngineVersion: !FindInMap ['DBEngine', '{{ environment.inputs.db_engine_mode }}', 'Version']
+      ScalingConfiguration: !If
+        - ChoiceServerlessDB
+        - MinCapacity: !FindInMap ['DBScalingConfiguration', '{{ environment.inputs.serverless_db_capacity }}', 'MinCapacity']
+          MaxCapacity: !FindInMap ['DBScalingConfiguration', '{{ environment.inputs.serverless_db_capacity }}', 'MaxCapacity']
+          AutoPause: !FindInMap ['DBScalingConfiguration', '{{ environment.inputs.serverless_db_capacity }}', 'AutoPause']
+          SecondsUntilAutoPause: !FindInMap ['DBScalingConfiguration', '{{ environment.inputs.serverless_db_capacity }}', 'SecondsUntilAutoPause']
+        - Ref: AWS::NoValue
+      DBSubnetGroupName: !Ref RDSClusterSubnetGroup
+      DBClusterParameterGroupName: !Ref RDSDBClusterParameterGroup
+      CopyTagsToSnapshot: true
+      VpcSecurityGroupIds:
+        - !GetAtt 
+          - VPC
+          - DefaultSecurityGroup
+      StorageEncrypted: true
+      BackupRetentionPeriod: !FindInMap ['DBConfig', 'BackupRetentionPeriod', 'Value']
+      PreferredBackupWindow: !If
+        - ChoiceProvisionedDB
+        - !FindInMap ['DBConfig', 'PreferredBackupWindow', 'Value']
+        - Ref: AWS::NoValue
+      PreferredMaintenanceWindow: !If
+        - ChoiceProvisionedDB
+        - !FindInMap ['DBConfig', 'PreferredMaintenanceWindow', 'Value']
+        - Ref: AWS::NoValue
+      DeletionProtection: !If [SetDeletionProtection, true, false]
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  # SecretsManager
+  RDSMasterUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !FindInMap ['ServiceConfig', 'RDSMasterUserSecret', 'Name']
+      Description: "This secret has a dynamically generated RDS credentials."
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "admin"}'
+        GenerateStringKey: password
+        ExcludeLowercase: false
+        ExcludeNumbers: false
+        ExcludePunctuation: true
+        ExcludeUppercase: false
+        IncludeSpace: false
+        RequireEachIncludedType: true
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  RDSClusterSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: for DB Cluster
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+
+  RDSClusterHostRecordSet:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !FindInMap ['ServiceConfig', 'RDSClusterAlias', 'Name']
+      Type: CNAME
+      ResourceRecords:
+        - !GetAtt 
+          - RDSCluster
+          - Endpoint.Address
+      TTL: 300
+
+  RDSDBClusterParameterGroup:
+    Type: "AWS::RDS::DBClusterParameterGroup"
+    Properties:
+      Description: Aurora Cluster Parameter Group
+      Family: aurora-mysql5.7
+      Parameters:
+        time_zone: Asia/Tokyo
+        character_set_client: utf8
+        character_set_connection: utf8
+        character_set_database: utf8
+        character_set_filesystem: utf8
+        character_set_results: utf8
+        character_set_server: utf8
+
+  RDBInstance1:
+    Type: 'AWS::RDS::DBInstance'
+    Condition: ChoiceProvisionedDB
+    Properties:
+      DBClusterIdentifier: !Ref RDSCluster
+      DBSubnetGroupName: !Ref RDSClusterSubnetGroup
+      DBInstanceClass: !FindInMap ['DBEngine', 'provisioned', 'InstanceClass']
+      Engine: !FindInMap ['DBEngine', 'provisioned', 'Name']
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  # ------------------------------------------------------------#
+  # ElastiCache (Redis)
+  # ------------------------------------------------------------#
+  CacheCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+      ReplicationGroupDescription: ''
+      AutomaticFailoverEnabled: false
+      AutoMinorVersionUpgrade: true
+      Engine: redis
+      EngineVersion: 6.0
+      CacheNodeType: cache.t3.small
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SnapshotRetentionLimit: 0
+      NumNodeGroups: 1
+      ReplicasPerNodeGroup: 0
+      SecurityGroupIds:
+        - !GetAtt
+          - VPC
+          - DefaultSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+  
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+      Description: ''
+      SubnetIds:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+
+  CacheClusterHostRecordSet:
+    Type: 'AWS::Route53::RecordSet'
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !FindInMap ['ServiceConfig', 'CacheClusterAlias', 'Name']
+      Type: CNAME
+      ResourceRecords:
+        - !GetAtt 
+          - CacheCluster
+          - PrimaryEndPoint.Address
+      TTL: 300
+
+
+  # ------------------------------------------------------------#
+  # Applicatin Load Balancer
+  # ------------------------------------------------------------#
+  # Public load balancer, hosted in public subnets that is accessible
+  # to the public, and is intended to route traffic to one or more public
+  # facing services. This is used for accepting traffic from the public
+  # internet and directing it to public facing microservices
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets:
+        # The load balancer is placed into the public subnets, so that traffic
+        # from the internet can reach the load balancer directly via the internet gateway
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
+      SecurityGroups:
+        - !Ref PublicLoadBalancerSG
+        - !GetAtt 
+          - VPC
+          - DefaultSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+
+  PublicLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+          # Allow access to ALB from anywhere on the internet
+          - CidrIp: 0.0.0.0/0
+            IpProtocol: -1
+      Tags:
+        - Key: Name
+          Value: !FindInMap ['EnvironmentNameConfig', 'Environment', 'Name']
+
+  EcsSecurityGroupIngressFromPublicALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the public ALB
+      GroupId: !Ref ContainerSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref PublicLoadBalancerSG
+
+  PublicLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Port: 443
+            Protocol: HTTPS
+            StatusCode: HTTP_301
+      LoadBalancerArn: !Ref PublicLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  PublicLoadBalancerHttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: 200
+            MessageBody: ''
+            ContentType: 'text/html'
+      LoadBalancerArn: !Ref PublicLoadBalancer
+      Certificates:
+        - CertificateArn: !FindInMap ['ServiceConfig', 'CertificateArn', 'Value']
+      Port: 443
+      Protocol: HTTPS
+
+  # ------------------------------------------------------------#
+  # Firewall
+  # ------------------------------------------------------------#
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !FindInMap ['ServiceConfig', 'WebAcl', 'Name']
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        SampledRequestsEnabled: true
+        MetricName: !FindInMap ['ServiceConfig', 'WebAcl', 'Name']
+      Rules:
+        - Name: AWS-AWSManagedRulesAnonymousIpList
+          Priority: 1
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAnonymousIpList
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: AWS-AWSManagedRulesAnonymousIpList
+        - Name: AWS-AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: AWS-AWSManagedRulesKnownBadInputsRuleSet
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 3
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+                - Name: SizeRestrictions_Cookie_HEADER
+                - Name: SizeRestrictions_QUERYSTRING
+                - Name: SizeRestrictions_URIPATH
+                - Name: CrossSiteScripting_BODY
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            SampledRequestsEnabled: true
+            MetricName: AWS-AWSManagedRulesCommonRuleSet
+      Tags:
+        - Key: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+        - Key: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+          Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      WebACLArn:
+        Fn::GetAtt:
+          - WebAcl
+          - Arn
+      ResourceArn: !Ref PublicLoadBalancer
+
 
 # These output values will be available to service templates to use.
 Outputs:
+  ServiceEnvironment:
+    Description: 'environment.inputs.service_environment'
+    Value: '{{ environment.inputs.service_environment }}'
+  CostProjectTagKey:
+    Description: 'The tag key for Cost Category Tag'
+    Value: !FindInMap ['ResourceTagConfig', 'Project', 'Key']
+  CostProjectTagValue:
+    Description: 'The tag value for Cost Category Tag'
+    Value: !FindInMap ['ResourceTagConfig', 'Project', 'Value']
+  CostServiceTagKey:
+    Description: 'The tag key for Cost Category Tag'
+    Value: !FindInMap ['ResourceTagConfig', 'Service', 'Key']
+  CostServiceTagValue:
+    Description: 'The tag value for Cost Category Tag'
+    Value: !FindInMap ['ResourceTagConfig', 'Service', 'Value']
+  CostEnvTagKey:
+    Description: 'The tag key for Cost Category Tag'
+    Value: !FindInMap ['ResourceTagConfig', 'Env', 'Key']
+  CostEnvTagValue:
+    Description: 'The tag value for Cost Category Tag'
+    Value: !FindInMap ['ResourceTagConfig', 'Env', 'Value']
   ClusterName:
     Description: The name of the ECS cluster
     Value: !Ref 'ECSCluster'
   ECSTaskExecutionRole:
-    Description: The ARN of the ECS role
+    Description: The ARN of the ECS task execution role
     Value: !GetAtt 'ECSTaskExecutionRole.Arn'
   VpcId:
     Description: The ID of the VPC that this stack is deployed in
     Value: !Ref 'VPC'
+  VpcCIDR:
+    Value: !GetAtt 
+      - VPC
+      - CidrBlock
+  VpcDefaultSecurityGroup:
+    Value: !GetAtt 
+      - VPC
+      - DefaultSecurityGroup
   PublicSubnetOne:
-    Description: Public subnet one
+    Description: A reference to the public subnet in the 1st Availability Zone
     Value: !Ref 'PublicSubnetOne'
   PublicSubnetTwo:
-    Description: Public subnet two
+    Description: A reference to the public subnet in the 2nd Availability Zone
     Value: !Ref 'PublicSubnetTwo'
+  PrivateSubnetOne:
+    Description: A reference to the private subnet in the 1st Availability Zone
+    Value: !Ref 'PrivateSubnetOne'
+  PrivateSubnetTwo:
+    Description: A reference to the private subnet in the 2nd Availability Zone
+    Value: !Ref 'PrivateSubnetTwo'
   ContainerSecurityGroup:
     Description: A security group used to allow Fargate containers to receive traffic
     Value: !Ref 'ContainerSecurityGroup'
+  PrivateHostedZone:
+    Description: The local HostedZoneId registered for VPC
+    Value: !Ref 'PrivateHostedZone'
+  EncryptionKey:
+    Description: A reference to the secret key in the SecretsManager
+    Value: !Ref 'EncryptionKey'
+  RDSCluster:
+    Value: !Ref RDSCluster
+  RDSMasterUserSecret:
+    Value: !Ref RDSMasterUserSecret
+  RDSMasterUserName:
+    Value: !Join ['', ['{{ "{{" }}resolve:secretsmanager:', !Ref RDSMasterUserSecret, ':SecretString:username}}' ]]
+  RDSMasterUserPassword:
+    Value: !Join ['', ['{{ "{{" }}resolve:secretsmanager:', !Ref RDSMasterUserSecret, ':SecretString:password}}' ]]
+  RDSMasterUserNameForECS:
+    Value: !Join ['', [!Ref RDSMasterUserSecret, ':username::' ]]
+  RDSMasterUserPasswordForECS:
+    Value: !Join ['', [!Ref RDSMasterUserSecret, ':password::' ]]
+  RDSClusterSubnetGroup:
+    Value: !Ref RDSClusterSubnetGroup
+  RDSClusterEndpointAddress:
+    Value: !GetAtt 
+      - RDSCluster
+      - Endpoint.Address
+  RDSClusterReadEndpointAddress:
+    Value: !If
+      - ChoiceProvisionedDB
+      - !GetAtt 
+        - RDSCluster
+        - ReadEndpoint.Address
+      - !GetAtt 
+        - RDSCluster
+        - Endpoint.Address
+  RDSClusterEndpointAddressAlias:
+    Value: !Ref 'RDSClusterHostRecordSet'
+  RDSDatabaseName:
+    Value: !FindInMap ['DBConfig', 'DatabaseName', '{{ environment.inputs.service_environment }}']
+  CacheClusterPrimaryEndpointAddress:
+    Value: !GetAtt 
+      - CacheCluster
+      - PrimaryEndPoint.Address
+  CacheClusterPrimaryEndpointPort:
+    Value: !GetAtt 
+      - CacheCluster
+      - PrimaryEndPoint.Port
+  CacheClusterPrimaryEndpointAddressAlias:
+    Value: !Ref 'CacheClusterHostRecordSet'
+  PublicLoadBalancerEndpoint:
+    Description: The URL to access the service
+    Value: !Sub "http://${PublicLoadBalancer.DNSName}"
+  PublicLoadBalancer:
+    Value: !Ref PublicLoadBalancer
+  PublicLoadBalancerHttpsListener:
+    Value: !Ref PublicLoadBalancerHttpsListener
+  WebAcl:
+    Value: !Ref WebAcl
